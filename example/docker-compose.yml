@@ -1,0 +1,99 @@
+# Demo store for the Vittas Payments plugin.
+#
+#   docker compose up -d          # WordPress + WooCommerce + the plugin
+#   docker compose run --rm seed  # install WordPress, seed a product and a page
+#   docker compose --profile tunnel up -d tunnel   # public HTTPS URL for webhooks
+#
+# The plugin directory is bind-mounted, so editing PHP on the host takes effect
+# on the next request — no rebuild, no reinstall.
+
+name: vittas-wordpress-demo
+
+services:
+  db:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MARIADB_DATABASE: wordpress
+      MARIADB_USER: wordpress
+      MARIADB_PASSWORD: wordpress
+      MARIADB_ROOT_PASSWORD: root
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+
+  wordpress:
+    # Unpinned WordPress on purpose: WooCommerce enforces a moving minimum
+    # WordPress version and refuses to install below it, so a pinned tag goes
+    # stale into a hard failure. PHP is what is actually pinned here.
+    image: wordpress:php8.2-apache
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${WP_PORT:-8080}:80"
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      # WP_DEBUG_LOG sends PHP notices to wp-content/debug.log, which is where
+      # the plugin's logger falls back to before WooCommerce is active.
+      WORDPRESS_DEBUG: 1
+      WORDPRESS_CONFIG_EXTRA: |
+        define( 'WP_DEBUG_LOG', true );
+        define( 'WP_DEBUG_DISPLAY', false );
+        /* The tunnel terminates TLS, so WordPress must be told the request was
+           HTTPS or it builds http:// URLs and the widget's origin check fails. */
+        if ( isset( $$_SERVER['HTTP_X_FORWARDED_PROTO'] ) && 'https' === $$_SERVER['HTTP_X_FORWARDED_PROTO'] ) {
+          $$_SERVER['HTTPS'] = 'on';
+        }
+    volumes:
+      - wp-data:/var/www/html
+      - ../vittas-payments:/var/www/html/wp-content/plugins/vittas-payments
+
+  # One-shot provisioner. Safe to re-run; it skips work already done.
+  seed:
+    image: wordpress:cli-php8.2
+    profiles: ["seed"]
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      WORDPRESS_DB_HOST: db
+      WORDPRESS_DB_NAME: wordpress
+      WORDPRESS_DB_USER: wordpress
+      WORDPRESS_DB_PASSWORD: wordpress
+      SITE_URL: ${SITE_URL:-http://localhost:8080}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      VITTAS_TEST_SECRET_KEY: ${VITTAS_TEST_SECRET_KEY:-}
+      VITTAS_TEST_WEBHOOK_SECRET: ${VITTAS_TEST_WEBHOOK_SECRET:-}
+      VITTAS_API_BASE: ${VITTAS_API_BASE:-}
+      VITTAS_WIDGET_SRC: ${VITTAS_WIDGET_SRC:-}
+    volumes:
+      - wp-data:/var/www/html
+      - ../vittas-payments:/var/www/html/wp-content/plugins/vittas-payments
+      - ./bin:/seed:ro
+    user: "33:33"
+    entrypoint: ["/bin/sh", "/seed/seed.sh"]
+
+  # Public HTTPS URL so Vittas can deliver webhooks to a laptop.
+  # Prints a trycloudflare.com URL: docker compose logs -f tunnel
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    depends_on:
+      - wordpress
+    command: tunnel --no-autoupdate --url http://wordpress:80
+
+volumes:
+  db-data:
+  wp-data:

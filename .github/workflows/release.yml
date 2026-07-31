@@ -1,0 +1,57 @@
+name: Release
+
+# Tag-driven: pushing v0.1.0 builds vittas-payments-0.1.0.zip and attaches it to
+# a GitHub release. plugin-update-checker reads that asset, so the zip attached
+# here is literally what merchants' sites download when they click "Update".
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build a release for, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
+
+      - name: Verify the tag matches the plugin header
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          HEADER=$(grep -m1 '^ \* Version:' vittas-payments/vittas-payments.php | awk '{print $3}')
+          # A tag that disagrees with the header ships an update that reports the
+          # old version, so WordPress offers it again on every check.
+          if [ "v$HEADER" != "$TAG" ]; then
+            echo "Tag $TAG does not match plugin header version $HEADER" >&2
+            exit 1
+          fi
+          echo "version $HEADER matches tag $TAG"
+
+      - name: Lint PHP
+        run: |
+          docker run --rm -v "$PWD/vittas-payments":/app:ro php:8.2-cli \
+            sh -c 'for f in $(find /app -name "*.php"); do php -l "$f" >/dev/null || exit 1; done; echo "php ok"'
+          docker run --rm -v "$PWD/vittas-payments":/app:ro php:7.4-cli \
+            sh -c 'for f in $(find /app -name "*.php"); do php -l "$f" >/dev/null || exit 1; done; echo "php 7.4 ok"'
+
+      - name: Build zip
+        id: build
+        run: |
+          bash bin/build-zip.sh
+          echo "zip=$(ls build/vittas-payments-*.zip)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
+          files: ${{ steps.build.outputs.zip }}
+          generate_release_notes: true

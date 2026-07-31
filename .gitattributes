@@ -1,0 +1,7 @@
+# seed.sh runs inside a Linux container — CRLF would make the shebang fail with
+# a bare "not found", which is a miserable thing to debug on a Windows checkout.
+*.sh text eol=lf
+*.php text eol=lf
+*.js  text eol=lf
+*.css text eol=lf
+*.yml text eol=lf
