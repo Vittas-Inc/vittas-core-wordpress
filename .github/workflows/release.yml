@@ -4,9 +4,7 @@ name: Release
 # a GitHub release. plugin-update-checker reads that asset, so the zip attached
 # here is literally what merchants' sites download when they click "Update".
 on:
-  push:
-    tags:
-      - 'v*'
+  # Auto-deploy disabled 2026-11-05 (security incident). Run manually: Actions tab -> Run workflow.
   workflow_dispatch:
     inputs:
       tag:
