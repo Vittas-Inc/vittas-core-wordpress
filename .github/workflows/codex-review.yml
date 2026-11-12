@@ -1,0 +1,31 @@
+name: Codex Code Review
+
+# AI review on every PR: Codex reads the diff and posts inline comments plus a
+# summary. This check does not fail on findings — merges are blocked by
+# branch protection ("Require conversation resolution before merging") until
+# each Codex thread is resolved. Security findings are gated separately in
+# security-scan.yml.
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: codex-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  codex:
+    name: Codex
+    if: github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/codex-reviewer.yml
+    with:
+      mode: code
+      fail-on: ""
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
