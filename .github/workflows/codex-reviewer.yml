@@ -129,7 +129,15 @@ jobs:
               return;
             }
             if (process.env.SKIPPED === 'true') {
-              core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available).`);
+              // Fail closed for the security gate. Fork PRs never receive
+              // secrets, so they get a notice and need a maintainer's review.
+              const pr0 = context.payload.pull_request;
+              const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+              if (process.env.MODE === 'security' && !fromFork) {
+                core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
+              } else {
+                core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available${fromFork ? ' to fork PRs' : ''}).`);
+              }
               return;
             }
             const mode = process.env.MODE;
@@ -143,14 +151,17 @@ jobs:
               ? { P0: 'Critical', P1: 'High', P2: 'Medium', P3: 'Low' }
               : { P0: 'P0', P1: 'P1', P2: 'P2', P3: 'P3' };
 
+            // Fail closed: unusable output must never read as a clean review.
             let result;
             try {
               result = JSON.parse(process.env.RESULT || '');
+              if (!result || typeof result !== 'object' || !Array.isArray(result.findings)) throw new Error('missing "findings" array');
             } catch (e) {
-              core.warning(`Could not parse Codex output as JSON: ${e.message}`);
-              result = { summary: (process.env.RESULT || '').slice(0, 60000), findings: [] };
+              await core.summary.addHeading(`${title}: unusable output`, 3).addCodeBlock((process.env.RESULT || '(empty)').slice(0, 20000)).write();
+              core.setFailed(`Codex ${mode} review returned output that is not valid findings JSON (${e.message}).`);
+              return;
             }
-            const findings = (result.findings || [])
+            const findings = result.findings
               .filter(f => f && f.title && ORDER[f.priority] !== undefined)
               .sort((a, b) => ORDER[a.priority] - ORDER[b.priority]);
 
@@ -169,11 +180,24 @@ jobs:
               commentable.set(f.filename, lines);
             }
 
-            // Skip findings already posted inline on an earlier run of this PR.
-            const existing = await github.paginate(github.rest.pulls.listReviewComments, { owner, repo, pull_number: pr.number, per_page: 100 });
-            const seen = new Set(existing
-              .filter(c => (c.body || '').includes(marker))
-              .map(c => `${c.path}:${c.line ?? c.original_line}:${(c.body.match(/\*\*\[[^\]]+\] (.*?)\*\*/) || [])[1]}`));
+            // Skip findings that already have an UNRESOLVED thread from an earlier
+            // run. A resolved one is re-posted so a recurring issue blocks again.
+            const seen = new Set();
+            let cursor = null;
+            do {
+              const q = await github.graphql(`query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+                repository(owner:$owner,name:$repo){ pullRequest(number:$number){
+                  reviewThreads(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor }
+                    nodes{ isResolved path line comments(first:1){ nodes{ body } } } } } } }`,
+                { owner, repo, number: pr.number, cursor });
+              const page = q.repository.pullRequest.reviewThreads;
+              for (const t of page.nodes) {
+                const b = t.comments.nodes[0]?.body || '';
+                if (t.isResolved || !b.includes(marker)) continue;
+                seen.add(`${t.path}:${t.line}:${(b.match(/\*\*\[[^\]]+\] (.*?)\*\*/) || [])[1]}`);
+              }
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
 
             const clean = p => String(p || '').replace(/^\.?\//, '');
             const inline = [], general = [];
@@ -182,7 +206,7 @@ jobs:
               const head = `**[${LABEL[f.priority]}] ${f.title}**`;
               const body = `${head}\n\n${f.body}\n\n${f.category ? `_Category: ${f.category}_\n` : ''}${marker}`;
               if (commentable.get(path)?.has(f.line)) {
-                if (!seen.has(`${path}:${f.line}:${f.title}`)) inline.push({ path, line: f.line, side: 'RIGHT', body });
+                if (!seen.has(`${path}:${f.line}:${f.title}`)) inline.push({ path, line: f.line, side: 'RIGHT', body, finding: f });
               } else {
                 general.push(f);
               }
@@ -193,20 +217,24 @@ jobs:
                 await github.rest.pulls.createReview({
                   owner, repo, pull_number: pr.number, commit_id: pr.head.sha, event: 'COMMENT',
                   body: `${title}: ${inline.length} new inline finding(s). Resolve each thread once addressed.\n${marker}`,
-                  comments: inline,
+                  comments: inline.map(({ finding, ...c }) => c),
                 });
               } catch (e) {
                 core.warning(`Inline review failed (${e.message}); listing findings in the summary instead.`);
-                for (const c of inline) general.push(findings.find(f => clean(f.file) === c.path && f.line === c.line));
+                for (const c of inline) general.push(c.finding);
               }
             }
 
             // Sticky summary comment (one per mode, edited in place).
             const counts = Object.keys(ORDER).map(p => [p, findings.filter(f => f.priority === p).length]).filter(([, n]) => n);
             const blocking = findings.filter(f => failOn.includes(f.priority));
+            // P0/P1 findings with no resolvable thread can't be enforced by
+            // conversation resolution, so they fail the check instead.
+            const unthreaded = general.filter(f => ['P0', 'P1'].includes(f.priority) && !failOn.includes(f.priority));
+            const fails = blocking.length + unthreaded.length > 0;
             const lines = [
               marker,
-              `### ${blocking.length ? '❌' : findings.length ? '⚠️' : '✅'} ${title}`,
+              `### ${fails ? '❌' : findings.length ? '⚠️' : '✅'} ${title}`,
               `Commit \`${pr.head.sha.slice(0, 7)}\` · ${findings.length ? counts.map(([p, n]) => `${n} ${LABEL[p]}`).join(' · ') : 'no issues found'}`,
               '',
               result.summary || '',
@@ -216,7 +244,7 @@ jobs:
               for (const f of general) lines.push(`- **[${LABEL[f.priority]}] ${f.title}** — \`${clean(f.file)}${f.line ? `:${f.line}` : ''}\`\n  ${String(f.body).replace(/\n/g, '\n  ')}`);
               lines.push('', '</details>');
             }
-            if (failOn.length) lines.push('', `_This check fails on: ${failOn.map(p => LABEL[p]).join(', ')}._`);
+            lines.push('', `_This check fails on: ${[...failOn.map(p => LABEL[p]), `${LABEL.P0}/${LABEL.P1} findings that could not be posted as inline threads`].join(', ')}._`);
             const body = lines.join('\n');
 
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
@@ -225,4 +253,7 @@ jobs:
             else await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
 
             await core.summary.addRaw(body).write();
-            if (blocking.length) core.setFailed(`${blocking.length} blocking ${title.toLowerCase()} finding(s) (${failOn.join(', ')}).`);
+            const reasons = [];
+            if (blocking.length) reasons.push(`${blocking.length} blocking finding(s) (${failOn.join(', ')})`);
+            if (unthreaded.length) reasons.push(`${unthreaded.length} P0/P1 finding(s) that could not be posted as resolvable review threads`);
+            if (reasons.length) core.setFailed(`${title}: ${reasons.join('; ')}.`);
