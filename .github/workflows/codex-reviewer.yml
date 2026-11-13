@@ -130,18 +130,32 @@ jobs:
             }
             if (process.env.SKIPPED === 'true') {
               // The security gate fails closed. Fork PRs never receive secrets,
-              // so a maintainer reviews them by hand and adds the
-              // `security-reviewed` label (needs write/triage access), which
-              // re-runs this check.
+              // so a maintainer reviews the exact head commit by hand, comments
+              //   /security-reviewed <head-sha>
+              // and re-runs this check. The approval is bound to that SHA: any
+              // new push changes the head and invalidates it. (A label can't be
+              // used: it survives pushes, and fork runs have a read-only token
+              // so it can't be removed automatically.)
               const pr0 = context.payload.pull_request;
               const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
-              const approved = (pr0?.labels || []).some(l => l.name === 'security-reviewed');
+              let approvedBy = null;
+              if (process.env.MODE === 'security' && fromFork) {
+                const head = pr0.head.sha.toLowerCase();
+                const cs = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr0.number, per_page: 100 });
+                const ok = cs.find(c => {
+                  const m = /^\/security-reviewed\s+([0-9a-f]{7,40})\b/im.exec(c.body || '');
+                  return m && head.startsWith(m[1].toLowerCase())
+                    && ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association)
+                    && c.user?.type !== 'Bot' && c.user?.login !== pr0.user?.login;
+                });
+                approvedBy = ok?.user?.login || null;
+              }
               if (process.env.MODE !== 'security') {
                 core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available${fromFork ? ' to fork PRs' : ''}).`);
-              } else if (fromFork && approved) {
-                core.notice('Fork PR: Codex security review cannot run; accepted via the maintainer "security-reviewed" label.');
+              } else if (fromFork && approvedBy) {
+                core.notice(`Fork PR: Codex security review cannot run; head ${pr0.head.sha.slice(0, 7)} manually approved by @${approvedBy}.`);
               } else if (fromFork) {
-                core.setFailed('Fork PR: Codex security review cannot run without secrets. A maintainer must review it and add the "security-reviewed" label.');
+                core.setFailed(`Fork PR: Codex security review cannot run without secrets. A maintainer must review head ${pr0.head.sha.slice(0, 7)}, comment "/security-reviewed ${pr0.head.sha}", then re-run this check.`);
               } else {
                 core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
               }
@@ -235,9 +249,9 @@ jobs:
             // Sticky summary comment (one per mode, edited in place).
             const counts = Object.keys(ORDER).map(p => [p, findings.filter(f => f.priority === p).length]).filter(([, n]) => n);
             const blocking = findings.filter(f => failOn.includes(f.priority));
-            // P0/P1 findings with no resolvable thread can't be enforced by
+            // Findings with no resolvable thread can't be enforced by
             // conversation resolution, so they fail the check instead.
-            const unthreaded = general.filter(f => ['P0', 'P1'].includes(f.priority) && !failOn.includes(f.priority));
+            const unthreaded = general.filter(f => !failOn.includes(f.priority));
             const fails = blocking.length + unthreaded.length > 0;
             const lines = [
               marker,
@@ -251,7 +265,7 @@ jobs:
               for (const f of general) lines.push(`- **[${LABEL[f.priority]}] ${f.title}** — \`${clean(f.file)}${f.line ? `:${f.line}` : ''}\`\n  ${String(f.body).replace(/\n/g, '\n  ')}`);
               lines.push('', '</details>');
             }
-            lines.push('', `_This check fails on: ${[...failOn.map(p => LABEL[p]), `${LABEL.P0}/${LABEL.P1} findings that could not be posted as inline threads`].join(', ')}._`);
+            lines.push('', `_This check fails on: ${[...failOn.map(p => LABEL[p]), 'any finding that could not be posted as an inline thread'].join(', ')}._`);
             const body = lines.join('\n');
 
             const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
@@ -262,5 +276,5 @@ jobs:
             await core.summary.addRaw(body).write();
             const reasons = [];
             if (blocking.length) reasons.push(`${blocking.length} blocking finding(s) (${failOn.join(', ')})`);
-            if (unthreaded.length) reasons.push(`${unthreaded.length} P0/P1 finding(s) that could not be posted as resolvable review threads`);
+            if (unthreaded.length) reasons.push(`${unthreaded.length} finding(s) that could not be posted as resolvable review threads`);
             if (reasons.length) core.setFailed(`${title}: ${reasons.join('; ')}.`);

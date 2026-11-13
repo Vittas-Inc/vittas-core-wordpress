@@ -15,9 +15,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
-    # labeled/unlabeled: re-evaluate the gate when a maintainer adds or
-    # removes `security-reviewed` on a fork PR.
-    types: [opened, reopened, synchronize, ready_for_review, labeled, unlabeled]
+    types: [opened, reopened, synchronize, ready_for_review]
   workflow_dispatch:
 
 permissions:

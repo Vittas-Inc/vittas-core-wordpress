@@ -22,6 +22,11 @@ report() { echo "::error title=Injection scan::$1"; fail=1; }
 
 # Tracked files, excluding this scanner and vendored/minified code.
 files() { git ls-files -- "$@" ':!:node_modules/**' ':!:**/*.min.js' ":!:$SELF"; }
+# NUL-delimited variant for xargs, so odd filenames (newlines, a leading '-')
+# can't split or be parsed as options. Every grep below also passes `--`.
+files0() { git ls-files -z -- "$@" ':!:node_modules/**' ':!:**/*.min.js' ":!:$SELF"; }
+# Tool errors (bad options, unreadable files) must fail the scan, never read as clean.
+errlog=$(mktemp); trap 'rm -f "$errlog"' EXIT
 
 # 1. Dropper files at repo root.
 for f in init init.js config.bat; do
@@ -30,31 +35,33 @@ done
 
 # 2. package.json scripts that execute a bare root file before the real command.
 while IFS= read -r p; do
-  if grep -nE '"[a-z:-]+"[[:space:]]*:[[:space:]]*"[^"]*node[[:space:]]+(\./)?(init|config|setup)(\.c?js)?[[:space:]]*(&&|;|")' "$p"; then
+  if grep -nE '"[a-z:-]+"[[:space:]]*:[[:space:]]*"[^"]*node[[:space:]]+(\./)?(init|config|setup)(\.c?js)?[[:space:]]*(&&|;|")' -- "$p" 2>>"$errlog"; then
     report "$p: npm script runs a root bootstrap file (node init && ...)"
   fi
 done < <(files '*package.json')
 
 # 3. Code hidden after long whitespace runs (pushes payload off-screen in editors/diffs).
-hits=$(files '*.js' '*.cjs' '*.mjs' '*.ts' '*.tsx' '*.jsx' '*.json' | tr '\n' '\0' |
-  xargs -0 -r grep -lE '[[:space:]]{150,}[^[:space:]]' 2>/dev/null)
+hits=$(files0 '*.js' '*.cjs' '*.mjs' '*.ts' '*.tsx' '*.jsx' '*.json' |
+  xargs -0 -r grep -lE -e '[[:space:]]{150,}[^[:space:]]' -- 2>>"$errlog")
 [ -n "$hits" ] && report "code hidden after long whitespace in: $(echo $hits)"
 
 # 4. Abnormally long single lines in build/tooling config files (obfuscated blobs).
 while IFS= read -r f; do
-  len=$(awk '{ if (length > m) m = length } END { print m + 0 }' "$f")
-  [ "$len" -gt 2000 ] && report "$f has a ${len}-char line (obfuscated config?)"
+  len=$(awk '{ if (length > m) m = length } END { print m + 0 }' "./$f" 2>>"$errlog")
+  [ "${len:-0}" -gt 2000 ] && report "$f has a ${len}-char line (obfuscated config?)"
 done < <(files '*.config.js' '*.config.cjs' '*.config.mjs' '*.config.ts' 'init*' 'api.js')
 
 # 5. Remote-code loaders / known IOCs.
 pat='anondrop\.net|eval\(proxyInfo|atob\(process\.env|eval\(await|new Function\(await|global\[.\\u00'
-hits=$(files '*.js' '*.cjs' '*.mjs' '*.ts' '*.tsx' '*.jsx' | tr '\n' '\0' | xargs -0 -r grep -lE "$pat" 2>/dev/null)
+hits=$(files0 '*.js' '*.cjs' '*.mjs' '*.ts' '*.tsx' '*.jsx' | xargs -0 -r grep -lE -e "$pat" -- 2>>"$errlog")
 [ -n "$hits" ] && report "remote-code-loader / known IOC pattern in: $(echo $hits)"
 
 # 6. Secrets hygiene: no tracked .env, and .gitignore must keep ignoring it.
 envs=$(git ls-files | grep -E '(^|/)\.env(\.[^/]*)?$' | grep -vE '\.(example|sample|template)$')
 [ -n "$envs" ] && report "tracked env file(s): $(echo $envs)"
 grep -qE '^\.env([[:space:]]|$)' .gitignore 2>/dev/null || report ".gitignore no longer ignores .env"
+
+[ -s "$errlog" ] && report "scanner tool error(s), scan incomplete: $(head -c 500 "$errlog" | tr '\n' ' ')"
 
 # 7. Terraform plan/state files embed full state snapshots, secrets included.
 tf=$(git ls-files | grep -E '(^|/)(tfplan|[^/]*\.tfplan|[^/]*\.tfstate(\.[^/]*)?)$')
