@@ -1,0 +1,9 @@
+# CI workflows, security tooling and AI-review rules need a maintainer's approval.
+# A PR could otherwise switch off its own checks or tell Codex to ignore a change.
+# Enforced by the "AI review gate" ruleset (require_code_owner_review).
+# Code owners must have write access; with two owners, neither one can
+# self-approve their own change.
+/.github/            @PiusLucky @EngrEric
+/scripts/security/   @PiusLucky @EngrEric
+AGENTS.md            @PiusLucky @EngrEric
+AGENTS.override.md   @PiusLucky @EngrEric

@@ -1,0 +1,290 @@
+name: Codex Reviewer (reusable)
+
+# Shared by codex-review.yml (mode: code) and security-scan.yml (mode: security).
+#
+# Job 1 runs Codex read-only with NO write token and sudo dropped, and emits
+# structured findings. Job 2 (no checkout, no Codex) posts them back to the PR:
+#   - one sticky summary comment per mode (updated in place on every push)
+#   - inline review comments on changed lines, which open review threads.
+#     With "Require conversation resolution before merging" on, unresolved
+#     Codex threads block the merge.
+#   - fails the check when a finding's priority is listed in `fail-on`.
+#
+# Needs repo/org secret OPENAI_API_KEY. Without it (fork PRs, secret not set)
+# the review is skipped with a warning and the check passes.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "code | security"
+        type: string
+        required: true
+      fail-on:
+        description: "Comma-separated priorities that fail the check, e.g. P0,P1. Empty = never fail."
+        type: string
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: false
+
+permissions: {}
+
+jobs:
+  review:
+    name: Codex ${{ inputs.mode }} review
+    # Pinned: codex-action's drop-sudo fails on Ubuntu 26.04 (ubuntu-latest
+    # since 2026-10-19) - openai/codex-action#188. Move back to ubuntu-latest
+    # once that issue is fixed; do not weaken safety-strategy instead.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      result: ${{ steps.codex.outputs.final-message }}
+      skipped: ${{ steps.preflight.outputs.skip }}
+    steps:
+      - name: Preflight
+        id: preflight
+        env:
+          HAS_KEY: ${{ secrets.OPENAI_API_KEY != '' }}
+          MODE: ${{ inputs.mode }}
+        run: |
+          if [ "$HAS_KEY" != "true" ]; then
+            echo "::warning title=Codex ${MODE} review skipped::OPENAI_API_KEY is not available (fork PR or secret not configured)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout PR merge commit
+        if: steps.preflight.outputs.skip != 'true'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          fetch-depth: 0
+          persist-credentials: false
+
+      # fetch-depth: 0 already brings both commits (they are the merge commit's
+      # parents). No second `git fetch`: credentials are not persisted, so it
+      # would fail on private repos.
+      - name: Verify PR base and head are present
+        if: steps.preflight.outputs.skip != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git cat-file -e "$BASE_SHA^{commit}" && git cat-file -e "$HEAD_SHA^{commit}"
+          git diff --stat "$BASE_SHA...$HEAD_SHA" | tail -1
+
+      # Must stay the LAST step of this job (Codex-run state can outlive the step).
+      - name: Run Codex
+        id: codex
+        if: steps.preflight.outputs.skip != 'true'
+        uses: openai/codex-action@bdf19a4a223ec2549a3e2274a0cf61556bc07675 # v1.13
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          safety-strategy: drop-sudo
+          permission-profile: ":read-only"
+          effort: ${{ inputs.mode == 'security' && 'high' || 'medium' }}
+          output-schema-file: .github/codex/findings.schema.json
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }} in ${{ github.repository }}.
+            Review mode: ${{ inputs.mode }}
+            Base commit: ${{ github.event.pull_request.base.sha }}
+            Head commit: ${{ github.event.pull_request.head.sha }}
+
+            The changes under review are exactly:
+              git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Follow the instructions in .github/codex/${{ inputs.mode }}-review.md (read it first),
+            plus any "Code Review Rules" in AGENTS.md files that cover the changed files.
+            Return only the JSON object required by the output schema.
+
+  # Always runs so the check always reports under its real name (a skipped job
+  # shows the unevaluated `${{ inputs.mode }}` and never satisfies a required
+  # check). This job is the merge gate for the mode.
+  post:
+    name: Post Codex ${{ inputs.mode }} findings
+    needs: review
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Publish review
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        env:
+          RESULT: ${{ needs.review.outputs.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          SKIPPED: ${{ needs.review.outputs.skipped }}
+          MODE: ${{ inputs.mode }}
+          FAIL_ON: ${{ inputs.fail-on }}
+        with:
+          script: |
+            if (process.env.REVIEW_RESULT !== 'success') {
+              core.setFailed(`Codex ${process.env.MODE} review job ${process.env.REVIEW_RESULT}; see the review job log.`);
+              return;
+            }
+            if (process.env.SKIPPED === 'true') {
+              // The security gate fails closed. Fork PRs never receive secrets,
+              // so a maintainer reviews the exact head commit by hand, comments
+              //   /security-reviewed <head-sha>
+              // and re-runs this check. The approval is bound to that SHA: any
+              // new push changes the head and invalidates it. (A label can't be
+              // used: it survives pushes, and fork runs have a read-only token
+              // so it can't be removed automatically.)
+              const pr0 = context.payload.pull_request;
+              const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
+              let approvedBy = null;
+              if (process.env.MODE === 'security' && fromFork) {
+                // Full 40-char SHA only: a short prefix can be brute-forced by
+                // the fork author to make a malicious commit match.
+                const head = pr0.head.sha.toLowerCase();
+                const cs = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr0.number, per_page: 100 });
+                const candidates = cs.filter(c => {
+                  const m = /^\/security-reviewed\s+([0-9a-f]{40})\s*$/im.exec(c.body || '');
+                  return m && m[1].toLowerCase() === head
+                    && c.user?.type !== 'Bot' && c.user?.login !== pr0.user?.login;
+                });
+                // author_association is affiliation, not permission: check the
+                // commenter's actual repo permission. Lookup errors count as no.
+                for (const c of candidates) {
+                  try {
+                    const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner: context.repo.owner, repo: context.repo.repo, username: c.user.login });
+                    if (['admin', 'maintain', 'write'].includes(data.role_name || data.permission)) { approvedBy = c.user.login; break; }
+                  } catch (e) {
+                    core.warning(`Could not verify permission of @${c.user.login}: ${e.message}`);
+                  }
+                }
+              }
+              if (process.env.MODE !== 'security') {
+                core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available${fromFork ? ' to fork PRs' : ''}).`);
+              } else if (fromFork && approvedBy) {
+                core.notice(`Fork PR: Codex security review cannot run; head ${pr0.head.sha.slice(0, 7)} manually approved by @${approvedBy}.`);
+              } else if (fromFork) {
+                core.setFailed(`Fork PR: Codex security review cannot run without secrets. A maintainer must review head ${pr0.head.sha.slice(0, 7)}, comment "/security-reviewed ${pr0.head.sha}", then re-run this check.`);
+              } else {
+                core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
+              }
+              return;
+            }
+            const mode = process.env.MODE;
+            const marker = `<!-- codex-review:${mode} -->`;
+            const failOn = (process.env.FAIL_ON || '').split(',').map(s => s.trim()).filter(Boolean);
+            const pr = context.payload.pull_request;
+            const { owner, repo } = context.repo;
+            const title = mode === 'security' ? 'Codex security review' : 'Codex code review';
+            const ORDER = { P0: 0, P1: 1, P2: 2, P3: 3 };
+            const LABEL = mode === 'security'
+              ? { P0: 'Critical', P1: 'High', P2: 'Medium', P3: 'Low' }
+              : { P0: 'P0', P1: 'P1', P2: 'P2', P3: 'P3' };
+
+            // Fail closed: unusable output must never read as a clean review.
+            let result;
+            try {
+              result = JSON.parse(process.env.RESULT || '');
+              if (!result || typeof result !== 'object' || !Array.isArray(result.findings)) throw new Error('missing "findings" array');
+            } catch (e) {
+              await core.summary.addHeading(`${title}: unusable output`, 3).addCodeBlock((process.env.RESULT || '(empty)').slice(0, 20000)).write();
+              core.setFailed(`Codex ${mode} review returned output that is not valid findings JSON (${e.message}).`);
+              return;
+            }
+            const findings = result.findings
+              .filter(f => f && f.title && ORDER[f.priority] !== undefined)
+              .sort((a, b) => ORDER[a.priority] - ORDER[b.priority]);
+
+            // RIGHT-side lines present in the PR diff (only these accept inline comments).
+            const files = await github.paginate(github.rest.pulls.listFiles, { owner, repo, pull_number: pr.number, per_page: 100 });
+            const commentable = new Map();
+            for (const f of files) {
+              const lines = new Set();
+              let n = 0;
+              for (const l of (f.patch || '').split('\n')) {
+                const m = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+                if (m) { n = Number(m[1]); continue; }
+                if (l.startsWith('-') || l.startsWith('\\')) continue;
+                lines.add(n++);
+              }
+              commentable.set(f.filename, lines);
+            }
+
+            // Skip findings that already have an UNRESOLVED thread from an earlier
+            // run. A resolved one is re-posted so a recurring issue blocks again.
+            const seen = new Set();
+            let cursor = null;
+            do {
+              const q = await github.graphql(`query($owner:String!,$repo:String!,$number:Int!,$cursor:String){
+                repository(owner:$owner,name:$repo){ pullRequest(number:$number){
+                  reviewThreads(first:100, after:$cursor){ pageInfo{ hasNextPage endCursor }
+                    nodes{ isResolved path line comments(first:1){ nodes{ body } } } } } } }`,
+                { owner, repo, number: pr.number, cursor });
+              const page = q.repository.pullRequest.reviewThreads;
+              for (const t of page.nodes) {
+                const b = t.comments.nodes[0]?.body || '';
+                if (t.isResolved || !b.includes(marker)) continue;
+                seen.add(`${t.path}:${t.line}:${(b.match(/\*\*\[[^\]]+\] (.*?)\*\*/) || [])[1]}`);
+              }
+              cursor = page.pageInfo.hasNextPage ? page.pageInfo.endCursor : null;
+            } while (cursor);
+
+            const clean = p => String(p || '').replace(/^\.?\//, '');
+            const inline = [], general = [];
+            for (const f of findings) {
+              const path = clean(f.file);
+              const head = `**[${LABEL[f.priority]}] ${f.title}**`;
+              const body = `${head}\n\n${f.body}\n\n${f.category ? `_Category: ${f.category}_\n` : ''}${marker}`;
+              if (commentable.get(path)?.has(f.line)) {
+                if (!seen.has(`${path}:${f.line}:${f.title}`)) inline.push({ path, line: f.line, side: 'RIGHT', body, finding: f });
+              } else {
+                general.push(f);
+              }
+            }
+
+            if (inline.length) {
+              try {
+                await github.rest.pulls.createReview({
+                  owner, repo, pull_number: pr.number, commit_id: pr.head.sha, event: 'COMMENT',
+                  body: `${title}: ${inline.length} new inline finding(s). Resolve each thread once addressed.\n${marker}`,
+                  comments: inline.map(({ finding, ...c }) => c),
+                });
+              } catch (e) {
+                core.warning(`Inline review failed (${e.message}); listing findings in the summary instead.`);
+                for (const c of inline) general.push(c.finding);
+              }
+            }
+
+            // Sticky summary comment (one per mode, edited in place).
+            const counts = Object.keys(ORDER).map(p => [p, findings.filter(f => f.priority === p).length]).filter(([, n]) => n);
+            const blocking = findings.filter(f => failOn.includes(f.priority));
+            // Findings with no resolvable thread can't be enforced by
+            // conversation resolution, so they fail the check instead.
+            const unthreaded = general.filter(f => !failOn.includes(f.priority));
+            const fails = blocking.length + unthreaded.length > 0;
+            const lines = [
+              marker,
+              `### ${fails ? '❌' : findings.length ? '⚠️' : '✅'} ${title}`,
+              `Commit \`${pr.head.sha.slice(0, 7)}\` · ${findings.length ? counts.map(([p, n]) => `${n} ${LABEL[p]}`).join(' · ') : 'no issues found'}`,
+              '',
+              result.summary || '',
+            ];
+            if (general.length) {
+              lines.push('', '<details open><summary>Findings outside the diff</summary>', '');
+              for (const f of general) lines.push(`- **[${LABEL[f.priority]}] ${f.title}** — \`${clean(f.file)}${f.line ? `:${f.line}` : ''}\`\n  ${String(f.body).replace(/\n/g, '\n  ')}`);
+              lines.push('', '</details>');
+            }
+            lines.push('', `_This check fails on: ${[...failOn.map(p => LABEL[p]), 'any finding that could not be posted as an inline thread'].join(', ')}._`);
+            const body = lines.join('\n');
+
+            const comments = await github.paginate(github.rest.issues.listComments, { owner, repo, issue_number: pr.number, per_page: 100 });
+            const mine = comments.find(c => c.user?.type === 'Bot' && (c.body || '').includes(marker));
+            if (mine) await github.rest.issues.updateComment({ owner, repo, comment_id: mine.id, body });
+            else await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body });
+
+            await core.summary.addRaw(body).write();
+            const reasons = [];
+            if (blocking.length) reasons.push(`${blocking.length} blocking finding(s) (${failOn.join(', ')})`);
+            if (unthreaded.length) reasons.push(`${unthreaded.length} finding(s) that could not be posted as resolvable review threads`);
+            if (reasons.length) core.setFailed(`${title}: ${reasons.join('; ')}.`);

@@ -1,0 +1,91 @@
+name: Security Scan
+
+# CI security gate. Every job runs without deploy secrets and before any
+# dependency install, so a poisoned revision never executes here.
+#
+#   Injection scan   - blocks the supply-chain pattern force-pushed on 2026-11-05
+#                      (root `init` dropper, payloads hidden after whitespace,
+#                      remote eval loaders, committed .env).            [blocking]
+#   Secret scan      - TruffleHog, verified live credentials only.      [blocking]
+#   Dependency scan  - OSV-Scanner against lockfiles.                   [advisory]
+#   Codex security   - AI security review of the PR diff; fails on
+#                      Critical/High findings.                     [blocking, PRs]
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  injection:
+    name: Injection scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Scan tracked files
+        run: bash scripts/security/scan-injection.sh
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: TruffleHog
+        uses: trufflesecurity/trufflehog@ea68ca03c865c5f324e86e849ced20ed3cf9dbbb # v3.99.8
+        with:
+          version: 3.99.8
+          extra_args: --only-verified
+
+  dependencies:
+    name: Dependency scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # Advisory until the existing backlog is triaged: findings show in the
+      # log but do not fail the run. Remove continue-on-error to make it gate.
+      - name: OSV-Scanner
+        continue-on-error: true
+        uses: google/osv-scanner-action/osv-scanner-action@32d3cd482bdadfb38b186c0ad1b031902d55d932 # v2.7.1
+        with:
+          scan-args: |-
+            --recursive
+            --allow-no-lockfiles
+            ./
+
+  codex-security:
+    name: Codex
+    if: github.event_name == 'pull_request' && github.event.pull_request.draft == false
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/codex-reviewer.yml
+    with:
+      mode: security
+      fail-on: "P0,P1"
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}

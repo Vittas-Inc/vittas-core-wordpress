@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "findings"],
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "1-3 sentences: what the PR does and the overall verdict."
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["priority", "title", "body", "file", "line", "category"],
+        "properties": {
+          "priority": { "type": "string", "enum": ["P0", "P1", "P2", "P3"] },
+          "title": { "type": "string", "description": "One-line statement of the defect." },
+          "body": { "type": "string", "description": "Concrete failure/exploit scenario and the fix. Markdown allowed." },
+          "file": { "type": "string", "description": "Path relative to the repository root." },
+          "line": { "type": "integer", "description": "Line number in the HEAD version of the file, on a line changed by the PR when possible. 0 if not applicable." },
+          "category": { "type": "string", "description": "Short kebab-case label, e.g. correctness, authz, injection, secrets, payments-integrity." }
+        }
+      }
+    }
+  }
+}
