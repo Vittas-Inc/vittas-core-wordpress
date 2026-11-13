@@ -140,15 +140,25 @@ jobs:
               const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
               let approvedBy = null;
               if (process.env.MODE === 'security' && fromFork) {
+                // Full 40-char SHA only: a short prefix can be brute-forced by
+                // the fork author to make a malicious commit match.
                 const head = pr0.head.sha.toLowerCase();
                 const cs = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr0.number, per_page: 100 });
-                const ok = cs.find(c => {
-                  const m = /^\/security-reviewed\s+([0-9a-f]{7,40})\b/im.exec(c.body || '');
-                  return m && head.startsWith(m[1].toLowerCase())
-                    && ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(c.author_association)
+                const candidates = cs.filter(c => {
+                  const m = /^\/security-reviewed\s+([0-9a-f]{40})\s*$/im.exec(c.body || '');
+                  return m && m[1].toLowerCase() === head
                     && c.user?.type !== 'Bot' && c.user?.login !== pr0.user?.login;
                 });
-                approvedBy = ok?.user?.login || null;
+                // author_association is affiliation, not permission: check the
+                // commenter's actual repo permission. Lookup errors count as no.
+                for (const c of candidates) {
+                  try {
+                    const { data } = await github.rest.repos.getCollaboratorPermissionLevel({ owner: context.repo.owner, repo: context.repo.repo, username: c.user.login });
+                    if (['admin', 'maintain', 'write'].includes(data.role_name || data.permission)) { approvedBy = c.user.login; break; }
+                  } catch (e) {
+                    core.warning(`Could not verify permission of @${c.user.login}: ${e.message}`);
+                  }
+                }
               }
               if (process.env.MODE !== 'security') {
                 core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available${fromFork ? ' to fork PRs' : ''}).`);
