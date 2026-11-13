@@ -129,14 +129,21 @@ jobs:
               return;
             }
             if (process.env.SKIPPED === 'true') {
-              // Fail closed for the security gate. Fork PRs never receive
-              // secrets, so they get a notice and need a maintainer's review.
+              // The security gate fails closed. Fork PRs never receive secrets,
+              // so a maintainer reviews them by hand and adds the
+              // `security-reviewed` label (needs write/triage access), which
+              // re-runs this check.
               const pr0 = context.payload.pull_request;
               const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
-              if (process.env.MODE === 'security' && !fromFork) {
-                core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
-              } else {
+              const approved = (pr0?.labels || []).some(l => l.name === 'security-reviewed');
+              if (process.env.MODE !== 'security') {
                 core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available${fromFork ? ' to fork PRs' : ''}).`);
+              } else if (fromFork && approved) {
+                core.notice('Fork PR: Codex security review cannot run; accepted via the maintainer "security-reviewed" label.');
+              } else if (fromFork) {
+                core.setFailed('Fork PR: Codex security review cannot run without secrets. A maintainer must review it and add the "security-reviewed" label.');
+              } else {
+                core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
               }
               return;
             }
