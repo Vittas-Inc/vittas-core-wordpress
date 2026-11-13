@@ -130,25 +130,26 @@ jobs:
             }
             if (process.env.SKIPPED === 'true') {
               // The security gate fails closed. Fork PRs never receive secrets,
-              // so a maintainer reviews the exact head commit by hand, comments
-              //   /security-reviewed <head-sha>
-              // and re-runs this check. The approval is bound to that SHA: any
-              // new push changes the head and invalidates it. (A label can't be
-              // used: it survives pushes, and fork runs have a read-only token
-              // so it can't be removed automatically.)
+              // so a maintainer with write access reviews the head commit by
+              // hand, submits an "Approve" review on it, and re-runs this check.
+              // The approval is bound to that commit: any new push changes the
+              // head and invalidates it. (Labels survive pushes, and comments
+              // can be edited by any writer while keeping the original author.)
               const pr0 = context.payload.pull_request;
               const fromFork = pr0?.head?.repo?.full_name !== `${context.repo.owner}/${context.repo.repo}`;
               let approvedBy = null;
               if (process.env.MODE === 'security' && fromFork) {
-                // Full 40-char SHA only: a short prefix can be brute-forced by
-                // the fork author to make a malicious commit match.
+                // Approval = a GitHub "Approve" review on the exact head commit.
+                // Unlike a comment, a review can't be edited by someone else
+                // into an approval, and it records the commit it approved.
+                // Only each reviewer's LATEST review counts.
                 const head = pr0.head.sha.toLowerCase();
-                const cs = await github.paginate(github.rest.issues.listComments, { owner: context.repo.owner, repo: context.repo.repo, issue_number: pr0.number, per_page: 100 });
-                const candidates = cs.filter(c => {
-                  const m = /^\/security-reviewed\s+([0-9a-f]{40})\s*$/im.exec(c.body || '');
-                  return m && m[1].toLowerCase() === head
-                    && c.user?.type !== 'Bot' && c.user?.login !== pr0.user?.login;
-                });
+                const reviews = await github.paginate(github.rest.pulls.listReviews, { owner: context.repo.owner, repo: context.repo.repo, pull_number: pr0.number, per_page: 100 });
+                const latest = new Map();
+                for (const r of reviews) if (r.user && ['APPROVED', 'CHANGES_REQUESTED', 'DISMISSED'].includes(r.state)) latest.set(r.user.login, r);
+                const candidates = [...latest.values()].filter(r =>
+                  r.state === 'APPROVED' && (r.commit_id || '').toLowerCase() === head
+                  && r.user.type !== 'Bot' && r.user.login !== pr0.user?.login);
                 // author_association is affiliation, not permission: check the
                 // commenter's actual repo permission. Lookup errors count as no.
                 for (const c of candidates) {
@@ -165,7 +166,7 @@ jobs:
               } else if (fromFork && approvedBy) {
                 core.notice(`Fork PR: Codex security review cannot run; head ${pr0.head.sha.slice(0, 7)} manually approved by @${approvedBy}.`);
               } else if (fromFork) {
-                core.setFailed(`Fork PR: Codex security review cannot run without secrets. A maintainer must review head ${pr0.head.sha.slice(0, 7)}, comment "/security-reviewed ${pr0.head.sha}", then re-run this check.`);
+                core.setFailed(`Fork PR: Codex security review cannot run without secrets. A maintainer with write access must review head ${pr0.head.sha.slice(0, 7)}, submit an "Approve" review on it, then re-run this check.`);
               } else {
                 core.setFailed('Codex security review could not run: OPENAI_API_KEY is not available to this repository.');
               }
