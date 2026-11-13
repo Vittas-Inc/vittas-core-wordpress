@@ -62,13 +62,17 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Fetch PR base and head
+      # fetch-depth: 0 already brings both commits (they are the merge commit's
+      # parents). No second `git fetch`: credentials are not persisted, so it
+      # would fail on private repos.
+      - name: Verify PR base and head are present
         if: steps.preflight.outputs.skip != 'true'
         env:
-          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+          git cat-file -e "$BASE_SHA^{commit}" && git cat-file -e "$HEAD_SHA^{commit}"
+          git diff --stat "$BASE_SHA...$HEAD_SHA" | tail -1
 
       # Must stay the LAST step of this job (Codex-run state can outlive the step).
       - name: Run Codex
@@ -94,10 +98,13 @@ jobs:
             plus any "Code Review Rules" in AGENTS.md files that cover the changed files.
             Return only the JSON object required by the output schema.
 
+  # Always runs so the check always reports under its real name (a skipped job
+  # shows the unevaluated `${{ inputs.mode }}` and never satisfies a required
+  # check). This job is the merge gate for the mode.
   post:
     name: Post Codex ${{ inputs.mode }} findings
     needs: review
-    if: always() && needs.review.result == 'success' && needs.review.outputs.skipped != 'true'
+    if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
@@ -108,10 +115,20 @@ jobs:
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
         env:
           RESULT: ${{ needs.review.outputs.result }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          SKIPPED: ${{ needs.review.outputs.skipped }}
           MODE: ${{ inputs.mode }}
           FAIL_ON: ${{ inputs.fail-on }}
         with:
           script: |
+            if (process.env.REVIEW_RESULT !== 'success') {
+              core.setFailed(`Codex ${process.env.MODE} review job ${process.env.REVIEW_RESULT}; see the review job log.`);
+              return;
+            }
+            if (process.env.SKIPPED === 'true') {
+              core.notice(`Codex ${process.env.MODE} review skipped (OPENAI_API_KEY not available).`);
+              return;
+            }
             const mode = process.env.MODE;
             const marker = `<!-- codex-review:${mode} -->`;
             const failOn = (process.env.FAIL_ON || '').split(',').map(s => s.trim()).filter(Boolean);
